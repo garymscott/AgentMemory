@@ -1,0 +1,12 @@
+# Environment
+.env
+ui/.env.local
+**pycache**/
+
+# Build outputs
+ui/.next/
+ui/node_modules/
+
+# Data
+vector_store/
+
