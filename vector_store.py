@@ -69,13 +69,10 @@ class VectorStore:
         return memory_id
 
     def search(self, query_embedding: list[float], k: int = 5) -> List[Tuple[Memory, float]]:
-        """Search for similar memories"""
         try:
-            # Normalize query vector
             query_array = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
             faiss.normalize_L2(query_array)
 
-            # Get similarities and indices
             similarities, indices = self.index.search(query_array, k)
 
             results = []
@@ -88,21 +85,27 @@ class VectorStore:
                     memory_data = self.memories[memory_id]
                     embedding = self.index.reconstruct(int(idx)).tolist()
 
-                    # With normalized vectors, cosine similarity should be between -1 and 1
-                    # Clamp the value to ensure it stays in range
-                    sim = max(min(sim, 1.0), -1.0)
-                    # Apply exponential scaling to emphasize differences
-                    scaled_sim = ((sim + 1) / 2) ** 3 * 100 # Use cubic scaling
+                    # New scaling approach:
+                    # - Below 0.75: 0%
+                    # - 0.75 to 0.85: Linear scaling from 0-100%
+                    if sim < 0.75:
+                        scaled_sim = 0
+                    else:
+                        # Scale 0.75-0.85 range to 0-100
+                        scaled_sim = ((sim - 0.75) / 0.1) * 100
+                        scaled_sim = min(scaled_sim, 100)  # Cap at 100%
 
-                    print(f"Raw similarity: {sim}, Converted to: {scaled_sim}%")  # Debug
+                    if scaled_sim > 0:
+                        print(f"Memory: {memory_data['text']}")
+                        print(f"Raw similarity: {sim:.4f}, Scaled: {scaled_sim:.1f}%")
 
-                    memory = Memory(
-                        id=memory_id,
-                        text=memory_data["text"],
-                        metadata=memory_data["metadata"],
-                        embedding=embedding
-                    )
-                    results.append((memory, float(scaled_sim)))
+                        memory = Memory(
+                            id=memory_id,
+                            text=memory_data["text"],
+                            metadata=memory_data["metadata"],
+                            embedding=embedding
+                        )
+                        results.append((memory, float(scaled_sim)))
 
             return results
 
