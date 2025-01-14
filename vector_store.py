@@ -3,9 +3,13 @@ import faiss
 import json
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
-import openai
+from openai import AsyncOpenAI
 from pathlib import Path
 import pickle
+from dotenv import load_dotenv
+import uuid
+
+load_dotenv()
 
 @dataclass
 class Memory:
@@ -15,96 +19,96 @@ class Memory:
     metadata: Dict
 
 class VectorStore:
-    def __init__(
-        self,
-        dimension: int = 1536,  # Default for text-embedding-ada-002
-        index_key: str = "IVF100,Flat",
-        nprobe: int = 10,
-        store_path: str = "vector_store"
-    ):
+    def __init__(self, dimension: int = 1536, store_path: str = "vector_store"):
+        self.client = AsyncOpenAI()
         self.dimension = dimension
-        self.index_key = index_key
-        self.nprobe = nprobe
         self.store_path = Path(store_path)
         self.store_path.mkdir(exist_ok=True)
-        
+
         # Initialize FAISS index
-        self.quantizer = faiss.IndexFlatL2(self.dimension)
-        self.index = faiss.IndexIVFFlat(
-            self.quantizer, self.dimension, 100, faiss.METRIC_L2
-        )
-        
+        self.index = faiss.IndexFlatIP(self.dimension)
+
         # Memory management
-        self.memories: Dict[str, Memory] = {}
-        self.next_id = 0
-        
-        # Load existing data if available
+        self.memories = {}
+        self.id_to_index = {}  # UUID to FAISS index mapping
+        self.index_to_id = {}  # FAISS index to UUID mapping
+        self.next_index = 0    # Track next available FAISS index
+
+        # Load existing data
         self._load_store()
 
-    async def create_embedding(self, text: str) -> np.ndarray:
-        """Generate embedding using OpenAI's API"""
-        response = await openai.Embedding.acreate(
-            input=text,
-            model="text-embedding-ada-002"
+    async def create_embedding(self, text: str) -> list[float]:
+        """Create embedding using OpenAI API"""
+        response = await self.client.embeddings.create(
+            model="text-embedding-ada-002",
+            input=text
         )
-        return np.array(response["data"][0]["embedding"], dtype=np.float32)
+        return response.data[0].embedding
 
-    def add_memory(
-        self,
-        text: str,
-        embedding: np.ndarray,
-        metadata: Optional[Dict] = None
-    ) -> str:
-        """Add a new memory to the store"""
-        if not self.index.is_trained:
-            # Train with the first vector if index isn't trained
-            self.index.train(embedding.reshape(1, -1))
-        
-        memory_id = str(self.next_id)
-        self.next_id += 1
-        
-        # Store memory
-        self.memories[memory_id] = Memory(
-            id=memory_id,
-            text=text,
-            embedding=embedding,
-            metadata=metadata or {}
-        )
-        
+    def add_memory(self, text: str, embedding: list[float], metadata: dict = None) -> str:
+        """Add a memory to the store"""
+        embedding_array = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        faiss.normalize_L2(embedding_array) # In-place normalization
+        memory_id = str(uuid.uuid4())
+
         # Add to FAISS index
-        self.index.add(embedding.reshape(1, -1))
-        
-        # Save updates
+        self.index.add(embedding_array)
+
+        # Update mappings
+        self.id_to_index[memory_id] = self.next_index
+        self.index_to_id[self.next_index] = memory_id
+        self.next_index += 1
+
+        # Store memory
+        self.memories[memory_id] = {
+            "text": text,
+            "metadata": metadata
+        }
+
         self._save_store()
-        
         return memory_id
 
-    def search(
-        self,
-        query_embedding: np.ndarray,
-        k: int = 5
-    ) -> List[Tuple[Memory, float]]:
+    def search(self, query_embedding: list[float], k: int = 5) -> List[Tuple[Memory, float]]:
         """Search for similar memories"""
-        if not self.memories:
-            return []
-            
-        # Set number of clusters to probe
-        self.index.nprobe = self.nprobe
-        
-        # Search index
-        distances, indices = self.index.search(
-            query_embedding.reshape(1, -1), k
-        )
-        
-        # Get memories and their distances
-        results = []
-        for idx, dist in zip(indices[0], distances[0]):
-            if idx != -1:  # FAISS returns -1 for empty slots
-                memory_id = str(idx)
-                if memory_id in self.memories:
-                    results.append((self.memories[memory_id], float(dist)))
-        
-        return results
+        try:
+            # Normalize query vector
+            query_array = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
+            faiss.normalize_L2(query_array)
+
+            # Get similarities and indices
+            similarities, indices = self.index.search(query_array, k)
+
+            results = []
+            for sim, idx in zip(similarities[0], indices[0]):
+                if idx == -1:
+                    continue
+
+                memory_id = self.index_to_id.get(int(idx))
+                if memory_id and memory_id in self.memories:
+                    memory_data = self.memories[memory_id]
+                    embedding = self.index.reconstruct(int(idx)).tolist()
+
+                    # With normalized vectors, cosine similarity should be between -1 and 1
+                    # Clamp the value to ensure it stays in range
+                    sim = max(min(sim, 1.0), -1.0)
+                    # Apply exponential scaling to emphasize differences
+                    scaled_sim = ((sim + 1) / 2) ** 3 * 100 # Use cubic scaling
+
+                    print(f"Raw similarity: {sim}, Converted to: {scaled_sim}%")  # Debug
+
+                    memory = Memory(
+                        id=memory_id,
+                        text=memory_data["text"],
+                        metadata=memory_data["metadata"],
+                        embedding=embedding
+                    )
+                    results.append((memory, float(scaled_sim)))
+
+            return results
+
+        except Exception as e:
+            print(f"Search error: {str(e)}")
+            raise
 
     def update_memory(
         self,
@@ -116,9 +120,9 @@ class VectorStore:
         """Update an existing memory"""
         if memory_id not in self.memories:
             return False
-            
+
         memory = self.memories[memory_id]
-        
+
         # Update fields if provided
         if text is not None:
             memory.text = text
@@ -126,101 +130,111 @@ class VectorStore:
             memory.embedding = embedding
         if metadata is not None:
             memory.metadata.update(metadata)
-            
+
         # Since FAISS doesn't support updates, we need to rebuild the index
         self._rebuild_index()
-        
+
         # Save updates
         self._save_store()
-        
+
         return True
 
     def delete_memory(self, memory_id: str) -> bool:
         """Delete a memory"""
         if memory_id not in self.memories:
             return False
-            
+
         del self.memories[memory_id]
-        
+
         # Rebuild index without deleted memory
         self._rebuild_index()
-        
+
         # Save updates
         self._save_store()
-        
+
         return True
 
     def _rebuild_index(self):
         """Rebuild FAISS index from scratch"""
         if not self.memories:
             return
-            
+
         # Create new index
-        self.quantizer = faiss.IndexFlatL2(self.dimension)
-        self.index = faiss.IndexIVFFlat(
-            self.quantizer, self.dimension, 100, faiss.METRIC_L2
-        )
-        
+        self.index = faiss.IndexFlatL2(self.dimension)
+
         # Get all embeddings
         embeddings = np.vstack([
             memory.embedding for memory in self.memories.values()
         ])
-        
+
         # Train and add vectors
-        self.index.train(embeddings)
         self.index.add(embeddings)
+
 
     def _save_store(self):
         """Save the vector store to disk"""
         # Save FAISS index
-        faiss.write_index(
-            self.index,
-            str(self.store_path / "index.faiss")
-        )
-        
-        # Save memories and metadata
-        memories_data = {
-            memory_id: {
-                "text": memory.text,
-                "metadata": memory.metadata
-            }
-            for memory_id, memory in self.memories.items()
+        faiss.write_index(self.index, str(self.store_path / "index.faiss"))
+
+        # Save memories and mappings
+        save_data = {
+            "memories": {
+                memory_id: {
+                    "text": memory["text"],
+                    "metadata": memory["metadata"]
+                }
+                for memory_id, memory in self.memories.items()
+            },
+            "id_to_index": self.id_to_index,
+            "next_index": self.next_index
         }
-        
+
         with open(self.store_path / "memories.pkl", "wb") as f:
-            pickle.dump({
-                "memories": memories_data,
-                "next_id": self.next_id
-            }, f)
+            pickle.dump(save_data, f)
 
     def _load_store(self):
         """Load the vector store from disk"""
         index_path = self.store_path / "index.faiss"
         memories_path = self.store_path / "memories.pkl"
-        
-        if index_path.exists() and memories_path.exists():
+
+        if not (index_path.exists() and memories_path.exists()):
+            return
+
+        try:
             # Load FAISS index
             self.index = faiss.read_index(str(index_path))
-            
-            # Load memories and metadata
+
+            # Load memories and mappings
             with open(memories_path, "rb") as f:
                 data = pickle.load(f)
-                
-            memories_data = data["memories"]
-            self.next_id = data["next_id"]
-            
-            # Reconstruct memories
-            for memory_id, memory_data in memories_data.items():
-                # Get embedding from FAISS index
-                idx = int(memory_id)
-                embedding = self._get_embedding_from_index(idx)
-                
-                self.memories[memory_id] = Memory(
-                    id=memory_id,
-                    text=memory_data["text"],
-                    embedding=embedding,
-                    metadata=memory_data["metadata"]
-                )
+
+            # Handle old format data
+            if isinstance(data, dict) and "memories" in data:
+                if "id_to_index" in data:
+                    # New format
+                    self.memories = data["memories"]
+                    self.id_to_index = data["id_to_index"]
+                    self.next_index = data.get("next_index", 0)
+                else:
+                    # Old format - rebuild mappings
+                    print("Converting old format data to new format")
+                    self.memories = data["memories"]
+                    self.id_to_index = {}
+                    for idx, memory_id in enumerate(self.memories.keys()):
+                        self.id_to_index[memory_id] = idx
+                    self.next_index = len(self.memories)
+
+            # Rebuild index_to_id mapping
+            self.index_to_id = {idx: id for id, idx in self.id_to_index.items()}
+
+        except Exception as e:
+            print(f"Error loading store: {str(e)}")
+            # Initialize empty index if load fails
+            self.index = faiss.IndexFlatL2(self.dimension)
+            self.memories = {}
+            self.id_to_index = {}
+            self.index_to_id = {}
+            self.next_index = 0
 
     def _get_embedding_from_index(self, idx: int) -> np.ndarray:
         """Extract embedding from FAISS index by ID"""

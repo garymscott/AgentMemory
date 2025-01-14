@@ -40,7 +40,7 @@ export default function SearchBox() {
             <div key={memory.id} className="p-4 border rounded-lg">
               <p>{memory.text}</p>
               <div className="mt-2 text-sm text-gray-500">
-                Similarity: {(memory.similarity * 100).toFixed(1)}%
+                Similarity: {(memory.similarity).toFixed(1)}%
               </div>
             </div>
           ))}
