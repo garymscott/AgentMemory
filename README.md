@@ -78,18 +78,6 @@ npm run dev
 
 3. Access the application at `http://localhost:3000`
 
-## Usage
-
-1. **Adding Memories**:
-   - Enter text in the memory input field
-   - Add optional metadata like Location, Occasion, etc.
-   - Click "Add Memory" to store
-
-2. **Searching Memories**:
-   - Type in the search box
-   - Results appear automatically with similarity scores
-   - Matches are based on semantic meaning, not just keywords
-
 ## Project Structure
 
 ```
