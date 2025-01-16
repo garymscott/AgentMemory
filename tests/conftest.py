@@ -2,13 +2,14 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from app.database import Base, get_db, run_migrations
+from app.database import Base, get_db
 from app.api import app
 import os
 from redis import Redis
 from dotenv import load_dotenv
 import asyncio
 import logging
+from tests.init_test_db import init_test_database
 
 # Configure logging
 logging.basicConfig(
@@ -49,13 +50,16 @@ def event_loop():
 
 @pytest.fixture(scope="session", autouse=True)
 def create_test_database():
-    # Create tables
+    """Create test database tables and run migrations."""
+    # Drop existing tables
     Base.metadata.drop_all(bind=engine)
-    run_migrations(TEST_POSTGRES_URL)
+    
+    # Run migrations
+    init_test_database(TEST_POSTGRES_URL)
     
     yield
     
-    # Drop tables
+    # Clean up
     Base.metadata.drop_all(bind=engine)
 
 @pytest.fixture
