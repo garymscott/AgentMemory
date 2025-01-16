@@ -37,64 +37,68 @@ async def create_session(session: SessionCreate, db: Session = Depends(get_db)):
     db.refresh(db_session)
     return db_session
 
+@app.post("/sessions/{session_id}/end", response_model=SessionResponse)
+async def end_session(session_id: str, db: Session = Depends(get_db)):
+    session = db.query(DbSession).filter(
+        DbSession.id == session_id,
+        DbSession.status == "active"
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Active session not found")
+
+    # Move session data from Redis to PostgreSQL
+    session_keys = redis_client.keys(f"session:{session_id}:memory:*")
+    for key in session_keys:
+        memory_data = redis_client.hgetall(key)
+        if memory_data:
+            db_memory = Memory(
+                id=str(uuid.uuid4()),
+                text=memory_data["text"],
+                memory_metadata=eval(memory_data.get("memory_metadata", "{}")),
+                embedding=np.frombuffer(memory_data["embedding"]),
+                session_id=session_id
+            )
+            db.add(db_memory)
+            redis_client.delete(key)
+
+    session.status = "completed"
+    session.ended_at = datetime.utcnow()
+    db.commit()
+    db.refresh(session)
+    return session
+
 @app.post("/memories/", response_model=str)
 async def create_memory(memory: MemoryCreate, db: Session = Depends(get_db)):
     try:
         if memory.session_id:
-            # First verify session exists and is active
             session = db.query(DbSession).filter(
                 DbSession.id == memory.session_id,
                 DbSession.status == "active"
             ).first()
             if not session:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Active session not found"
-                )
+                raise HTTPException(status_code=404, detail="Active session not found")
 
-        # Generate embedding
-        try:
-            embedding = await store.create_embedding(memory.text)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to generate embedding: {str(e)}"
-            )
-
+        embedding = await store.create_embedding(memory.text)
         memory_id = str(uuid.uuid4())
 
         if memory.session_id:
-            # Store in Redis for active session
             redis_key = f"session:{memory.session_id}:memory:{memory_id}"
-            try:
-                redis_client.hset(redis_key, mapping={
-                    "text": memory.text,
-                    "memory_metadata": str(memory.memory_metadata or {}),
-                    "embedding": embedding.tobytes()
-                })
-                redis_client.expire(redis_key, 86400)  # 24 hour TTL
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to store in Redis: {str(e)}"
-                )
+            redis_client.hset(redis_key, mapping={
+                "text": memory.text,
+                "memory_metadata": str(memory.memory_metadata or {}),
+                "embedding": embedding.tobytes()
+            })
+            redis_client.expire(redis_key, 86400)
         else:
-            # Store directly in PostgreSQL
-            try:
-                db_memory = Memory(
-                    id=memory_id,
-                    text=memory.text,
-                    memory_metadata=memory.memory_metadata or {},
-                    embedding=embedding,
-                    session_id=memory.session_id
-                )
-                db.add(db_memory)
-                db.commit()
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to store in database: {str(e)}"
-                )
+            db_memory = Memory(
+                id=memory_id,
+                text=memory.text,
+                memory_metadata=memory.memory_metadata or {},
+                embedding=embedding,
+                session_id=memory.session_id
+            )
+            db.add(db_memory)
+            db.commit()
 
         return memory_id
 
@@ -103,22 +107,17 @@ async def create_memory(memory: MemoryCreate, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Unexpected error: {str(e)}"
+            detail=f"Failed to create memory: {str(e)}"
         )
 
 @app.get("/memories/", response_model=List[MemoryResponse])
-async def list_memories(
-    session_id: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
+async def list_memories(session_id: Optional[str] = None, db: Session = Depends(get_db)):
     try:
         if session_id:
-            # Verify session exists
             session = db.query(DbSession).filter(DbSession.id == session_id).first()
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
 
-            # Check Redis first for active session
             redis_keys = redis_client.keys(f"session:{session_id}:memory:*")
             redis_memories = []
             for key in redis_keys:
@@ -134,7 +133,6 @@ async def list_memories(
                         )
                     )
 
-            # Get memories from PostgreSQL for this session
             db_memories = db.query(Memory).filter(Memory.session_id == session_id).all()
             db_responses = [
                 MemoryResponse(
@@ -148,7 +146,6 @@ async def list_memories(
 
             return redis_memories + db_responses
         else:
-            # Only return persistent memories from PostgreSQL
             memories = db.query(Memory).all()
             return [
                 MemoryResponse(
@@ -159,8 +156,7 @@ async def list_memories(
                 )
                 for memory in memories
             ]
-    except HTTPException:
-        raise
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -170,7 +166,6 @@ async def list_memories(
 @app.get("/memories/{memory_id}", response_model=MemoryResponse)
 async def get_memory(memory_id: str, db: Session = Depends(get_db)):
     try:
-        # First check Redis for active session memories
         redis_keys = redis_client.keys(f"session:*:memory:{memory_id}")
         if redis_keys:
             memory_data = redis_client.hgetall(redis_keys[0])
@@ -183,7 +178,6 @@ async def get_memory(memory_id: str, db: Session = Depends(get_db)):
                     session_id=session_id
                 )
 
-        # If not in Redis, check PostgreSQL
         memory = db.query(Memory).filter(Memory.id == memory_id).first()
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -194,10 +188,125 @@ async def get_memory(memory_id: str, db: Session = Depends(get_db)):
             memory_metadata=memory.memory_metadata,
             session_id=memory.session_id
         )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get memory: {str(e)}"
+        )
+
+@app.put("/memories/{memory_id}", response_model=bool)
+async def update_memory(memory_id: str, update: MemoryUpdate, db: Session = Depends(get_db)):
+    try:
+        redis_keys = redis_client.keys(f"session:*:memory:{memory_id}")
+        if redis_keys:
+            key = redis_keys[0]
+            memory_data = redis_client.hgetall(key)
+            if memory_data:
+                if update.text:
+                    embedding = await store.create_embedding(update.text)
+                    redis_client.hset(key, "text", update.text)
+                    redis_client.hset(key, "embedding", embedding.tobytes())
+                if update.memory_metadata is not None:
+                    redis_client.hset(key, "memory_metadata", str(update.memory_metadata))
+                return True
+
+        memory = db.query(Memory).filter(Memory.id == memory_id).first()
+        if not memory:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        if update.text:
+            memory.text = update.text
+            memory.embedding = await store.create_embedding(update.text)
+        if update.memory_metadata is not None:
+            memory.memory_metadata = update.memory_metadata
+
+        db.commit()
+        return True
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve memory: {str(e)}"
+            detail=f"Failed to update memory: {str(e)}"
+        )
+
+@app.delete("/memories/{memory_id}", response_model=bool)
+async def delete_memory(memory_id: str, db: Session = Depends(get_db)):
+    try:
+        redis_keys = redis_client.keys(f"session:*:memory:{memory_id}")
+        if redis_keys:
+            redis_client.delete(redis_keys[0])
+            return True
+
+        memory = db.query(Memory).filter(Memory.id == memory_id).first()
+        if not memory:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        db.delete(memory)
+        db.commit()
+        return True
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete memory: {str(e)}"
+        )
+
+@app.post("/memories/search/", response_model=List[MemoryResponse])
+async def search_memories(search: MemorySearch, db: Session = Depends(get_db)):
+    try:
+        query_embedding = await store.create_embedding(search.query)
+        results = []
+
+        if search.session_id:
+            redis_keys = redis_client.keys(f"session:{search.session_id}:memory:*")
+            for key in redis_keys:
+                memory_data = redis_client.hgetall(key)
+                if memory_data:
+                    memory_embedding = np.frombuffer(memory_data["embedding"])
+                    similarity = store._calculate_similarity(query_embedding, memory_embedding)
+                    if similarity > 0:
+                        memory_id = key.split(":")[-1]
+                        results.append((
+                            MemoryResponse(
+                                id=memory_id,
+                                text=memory_data["text"],
+                                memory_metadata=eval(memory_data["memory_metadata"]),
+                                similarity=similarity,
+                                session_id=search.session_id
+                            ),
+                            similarity
+                        ))
+
+        db_memories = db.query(Memory).order_by(
+            Memory.embedding.cosine_distance(query_embedding)
+        ).limit(search.k).all()
+
+        for memory in db_memories:
+            similarity = store._calculate_similarity(query_embedding, memory.embedding)
+            if similarity > 0:
+                results.append((
+                    MemoryResponse(
+                        id=memory.id,
+                        text=memory.text,
+                        memory_metadata=memory.memory_metadata,
+                        similarity=similarity,
+                        session_id=memory.session_id
+                    ),
+                    similarity
+                ))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return [result[0] for result in results[:search.k]]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to search memories: {str(e)}"
         )
