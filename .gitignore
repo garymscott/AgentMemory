@@ -1,5 +1,6 @@
 # Environment
 .env
+.env.test
 ui/.env.local
 **pycache**/
 
@@ -10,3 +11,16 @@ ui/node_modules/
 # Data
 vector_store/
 
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+
+# Generated data
+vector_store/
+*.faiss
+
+# Logs
+*.log
