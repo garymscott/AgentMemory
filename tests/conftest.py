@@ -9,7 +9,6 @@ from redis import Redis
 from dotenv import load_dotenv
 import asyncio
 import logging
-from tests.mock_vector_store import MockVectorStore
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 # Load test environment variables
 load_dotenv('.env.test')
+
+# Ensure we're in test mode
+os.environ.pop('OPENAI_API_KEY', None)
 
 # Test database URL
 TEST_POSTGRES_URL = os.getenv(
@@ -70,13 +72,8 @@ def db_session():
     connection.close()
 
 @pytest.fixture
-def client(db_session, monkeypatch):
-    """Create a test client with a fresh database session and mock vector store."""
-    # Replace VectorStore with MockVectorStore
-    from app.api import app, store
-    mock_store = MockVectorStore()
-    monkeypatch.setattr("app.api.store", mock_store)
-    
+def client(db_session):
+    """Create a test client with a fresh database session."""
     def override_get_db():
         try:
             yield db_session
