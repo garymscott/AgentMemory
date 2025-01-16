@@ -1,30 +1,40 @@
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 from redis import Redis
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from alembic import command
+from alembic.config import Config
 
 # Database URLs
-POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://user:password@localhost/agent_memory")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://gary@localhost/agent_memory"
+)
+REDIS_URL = os.getenv(
+    "REDIS_URL",
+    "redis://localhost/0"
+)
 
-# PostgreSQL connection
-engine = create_engine(POSTGRES_URL)
+# Create engine
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Redis connection
+# Create Redis client
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
-# SQLAlchemy Base
+# Create base class for SQLAlchemy models
 Base = declarative_base()
 
-# Database dependency
+# Dependency to get database session
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+# Function to run database migrations
+def run_migrations(connection_url: str):
+    alembic_cfg = Config("alembic.ini")
+    alembic_cfg.set_main_option("sqlalchemy.url", connection_url)
+    command.upgrade(alembic_cfg, "head")
