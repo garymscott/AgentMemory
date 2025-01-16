@@ -25,13 +25,13 @@ class VectorStore:
             # Initialize FAISS index for optional in-memory search
             self.index = faiss.IndexFlatIP(self.dimension)
 
-    async def create_embedding(self, text: str) -> list[float]:
+    async def create_embedding(self, text: str) -> np.ndarray:
         """Create embedding using OpenAI API"""
         response = await self.client.embeddings.create(
             model="text-embedding-ada-002",
             input=text
         )
-        return response.data[0].embedding
+        return np.array(response.data[0].embedding, dtype=np.float32)
 
     def add_to_faiss(self, memory_id: str, embedding: np.ndarray):
         """Add embedding to FAISS index if enabled"""
@@ -53,8 +53,7 @@ class VectorStore:
         """Search for similar memories using pgvector and/or Redis"""
         # Generate query embedding
         query_embedding = await self.create_embedding(query)
-        query_array = np.array(query_embedding, dtype=np.float32)
-
+        
         results = []
 
         if session_id:
@@ -68,7 +67,7 @@ class VectorStore:
                         dtype=np.float32
                     )
                     similarity = self._calculate_similarity(
-                        query_array,
+                        query_embedding,
                         memory_embedding
                     )
                     if similarity > 0:
@@ -76,20 +75,20 @@ class VectorStore:
                             id=key.split(":")[-1],
                             text=memory_data["text"],
                             embedding=memory_embedding,
-                            metadata=eval(memory_data["metadata"]),
+                            metadata=eval(memory_data["memory_metadata"]),
                             session_id=session_id
                         )
                         results.append((memory, similarity))
 
         # Search in PostgreSQL with pgvector
-        from db.config import Memory as DbMemory
+        from app.models import Memory as DbMemory
         db_memories = db.query(DbMemory).order_by(
             DbMemory.embedding.cosine_distance(query_embedding)
         ).limit(k).all()
 
         for db_memory in db_memories:
             similarity = self._calculate_similarity(
-                query_array,
+                query_embedding,
                 np.array(db_memory.embedding)
             )
             if similarity > 0:
@@ -97,7 +96,7 @@ class VectorStore:
                     id=db_memory.id,
                     text=db_memory.text,
                     embedding=db_memory.embedding,
-                    metadata=db_memory.metadata,
+                    metadata=db_memory.memory_metadata,
                     session_id=db_memory.session_id
                 )
                 results.append((memory, similarity))
