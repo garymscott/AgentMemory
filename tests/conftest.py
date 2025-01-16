@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from app.database import Base, get_db
+from app.database import Base, get_db, run_migrations
 from app.api import app
 import os
 from redis import Redis
@@ -31,7 +31,7 @@ TEST_REDIS_URL = os.getenv(
 )
 
 # Create test database engine
-engine = create_engine(TEST_POSTGRES_URL, echo=True)  # Enable SQL logging
+engine = create_engine(TEST_POSTGRES_URL, echo=True)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Test Redis client
@@ -44,7 +44,18 @@ def event_loop():
     yield loop
     loop.close()
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session", autouse=True)
+def create_test_database():
+    # Create tables
+    Base.metadata.drop_all(bind=engine)
+    run_migrations(TEST_POSTGRES_URL)
+    
+    yield
+    
+    # Drop tables
+    Base.metadata.drop_all(bind=engine)
+
+@pytest.fixture
 def db_session():
     """Create a fresh database session for each test."""
     connection = engine.connect()
