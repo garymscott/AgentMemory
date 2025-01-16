@@ -8,6 +8,14 @@ import os
 from redis import Redis
 from dotenv import load_dotenv
 import asyncio
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Load test environment variables
 load_dotenv('.env.test')
@@ -23,7 +31,7 @@ TEST_REDIS_URL = os.getenv(
 )
 
 # Create test database engine
-engine = create_engine(TEST_POSTGRES_URL)
+engine = create_engine(TEST_POSTGRES_URL, echo=True)  # Enable SQL logging
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Test Redis client
@@ -36,14 +44,9 @@ def event_loop():
     yield loop
     loop.close()
 
-@pytest.fixture(scope="session", autouse=True)
-def create_test_database():
-    Base.metadata.create_all(bind=engine)
-    yield
-    Base.metadata.drop_all(bind=engine)
-
-@pytest.fixture
+@pytest.fixture(scope="function")
 def db_session():
+    """Create a fresh database session for each test."""
     connection = engine.connect()
     transaction = connection.begin()
     session = TestingSessionLocal(bind=connection)
@@ -56,6 +59,7 @@ def db_session():
 
 @pytest.fixture
 def client(db_session):
+    """Create a test client with a fresh database session."""
     def override_get_db():
         try:
             yield db_session
@@ -69,5 +73,6 @@ def client(db_session):
 
 @pytest.fixture(autouse=True)
 def clean_redis():
+    """Clean Redis database after each test."""
     yield
     test_redis_client.flushdb()
