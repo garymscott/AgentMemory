@@ -24,103 +24,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/memories/", response_model=List[MemoryResponse])
-async def list_memories(
-    session_id: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    if session_id:
-        # Check Redis first for active session
-        redis_keys = redis_client.keys(f"session:{session_id}:memory:*")
-        redis_memories = []
-        for key in redis_keys:
-            memory_data = redis_client.hgetall(key)
-            if memory_data:
-                memory_id = key.split(":")[-1]
-                redis_memories.append(
-                    MemoryResponse(
-                        id=memory_id,
-                        text=memory_data["text"],
-                        memory_metadata=eval(memory_data["memory_metadata"]),
-                        session_id=session_id
-                    )
-                )
+@app.post("/sessions/", response_model=SessionResponse)
+async def create_session(session: SessionCreate, db: Session = Depends(get_db)):
+    session_id = str(uuid.uuid4())
+    db_session = DbSession(
+        id=session_id,
+        status="active",
+        session_metadata=session.session_metadata or {}
+    )
+    db.add(db_session)
+    db.commit()
+    db.refresh(db_session)
+    return db_session
 
-        # Get memories from PostgreSQL for this session
-        db_memories = db.query(Memory).filter(Memory.session_id == session_id).all()
-        db_responses = [
-            MemoryResponse(
-                id=memory.id,
-                text=memory.text,
-                memory_metadata=memory.memory_metadata,
-                session_id=memory.session_id
+@app.post("/sessions/{session_id}/end", response_model=SessionResponse)
+async def end_session(session_id: str, db: Session = Depends(get_db)):
+    session = db.query(DbSession).filter(DbSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Move session data from Redis to PostgreSQL
+    session_keys = redis_client.keys(f"session:{session_id}:memory:*")
+    for key in session_keys:
+        memory_data = redis_client.hgetall(key)
+        if memory_data:
+            db_memory = Memory(
+                id=str(uuid.uuid4()),
+                text=memory_data["text"],
+                memory_metadata=eval(memory_data.get("memory_metadata", "{}")),
+                embedding=np.frombuffer(memory_data["embedding"]),
+                session_id=session_id
             )
-            for memory in db_memories
-        ]
+            db.add(db_memory)
+            redis_client.delete(key)
 
-        return redis_memories + db_responses
-    else:
-        # Only return persistent memories from PostgreSQL
-        memories = db.query(Memory).all()
-        return [
-            MemoryResponse(
-                id=memory.id,
-                text=memory.text,
-                memory_metadata=memory.memory_metadata,
-                session_id=memory.session_id
-            )
-            for memory in memories
-        ]
-
-@app.post("/memories/search/", response_model=List[MemoryResponse])
-async def search_memories(
-    search: MemorySearch,
-    db: Session = Depends(get_db)
-):
-    try:
-        query_embedding = await store.create_embedding(search.query)
-        results = []
-
-        if search.session_id:
-            # Search in Redis for active session
-            redis_keys = redis_client.keys(f"session:{search.session_id}:memory:*")
-            for key in redis_keys:
-                memory_data = redis_client.hgetall(key)
-                if memory_data:
-                    memory_embedding = np.frombuffer(memory_data["embedding"])
-                    similarity = np.dot(query_embedding, memory_embedding)
-                    results.append((
-                        MemoryResponse(
-                            id=key.split(":")[-1],
-                            text=memory_data["text"],
-                            memory_metadata=eval(memory_data["memory_metadata"]),
-                            similarity=float(similarity),
-                            session_id=search.session_id
-                        ),
-                        similarity
-                    ))
-
-        # Search in PostgreSQL using pgvector
-        db_results = db.query(Memory).order_by(
-            Memory.embedding.cosine_distance(query_embedding)
-        ).limit(search.k).all()
-
-        for memory in db_results:
-            similarity = 1 - np.dot(query_embedding, memory.embedding)
-            results.append((
-                MemoryResponse(
-                    id=memory.id,
-                    text=memory.text,
-                    memory_metadata=memory.memory_metadata,
-                    similarity=float(similarity),
-                    session_id=memory.session_id
-                ),
-                similarity
-            ))
-
-        # Sort combined results by similarity
-        results.sort(key=lambda x: x[1], reverse=True)
-        return [result[0] for result in results[:search.k]]
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    session.status = "completed"
+    session.ended_at = datetime.utcnow()
+    db.commit()
+    db.refresh(session)
+    return session
