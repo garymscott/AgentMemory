@@ -8,10 +8,13 @@ import os
 from redis import Redis
 from dotenv import load_dotenv
 
+# Configure pytest-asyncio
+pytest.asyncio_fixture_loop_scope = "function"
+
 # Load test environment variables
 load_dotenv('.env.test')
 
-# Test database URL - use your actual username instead of 'user'
+# Test database URL
 TEST_POSTGRES_URL = os.getenv(
     "TEST_POSTGRES_URL",
     "postgresql://gary@localhost/agent_memory_test"  # Default without password if not set
