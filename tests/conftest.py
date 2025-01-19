@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from app.database import Base, get_db
 from app.api import app
@@ -51,16 +51,26 @@ def event_loop():
 @pytest.fixture(scope="session", autouse=True)
 def create_test_database():
     """Create test database tables and run migrations."""
-    # Drop existing tables
-    Base.metadata.drop_all(bind=engine)
+    # Drop all tables in the correct order using CASCADE
+    with engine.connect() as connection:
+        connection.execute(text("""DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO gary;
+GRANT ALL ON SCHEMA public TO public;"""))
+        connection.commit()
     
     # Run migrations
     init_test_database(TEST_POSTGRES_URL)
     
     yield
     
-    # Clean up
-    Base.metadata.drop_all(bind=engine)
+    # Cleanup using CASCADE
+    with engine.connect() as connection:
+        connection.execute(text("DROP SCHEMA public CASCADE;"))
+        connection.execute(text("CREATE SCHEMA public;"))
+        connection.execute(text("GRANT ALL ON SCHEMA public TO gary;"))
+        connection.execute(text("GRANT ALL ON SCHEMA public TO public;"))
+        connection.commit()
 
 @pytest.fixture
 def db_session():
